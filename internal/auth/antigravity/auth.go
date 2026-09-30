@@ -82,11 +82,11 @@ func antigravityLoadCodeAssistMetadata() map[string]string {
 	}
 }
 
-func antigravityControlPlaneMetadata(userAgent string) map[string]string {
+func antigravityControlPlaneMetadata() map[string]string {
 	return map[string]string{
-		"ide_type":    "ANTIGRAVITY",
-		"ide_version": misc.AntigravityVersionFromUserAgent(userAgent),
-		"ide_name":    "antigravity",
+		"ideType":    "ANTIGRAVITY",
+		"platform":   "PLATFORM_UNSPECIFIED",
+		"pluginType": "GEMINI",
 	}
 }
 
@@ -128,14 +128,39 @@ func defaultAntigravityTierID(loadResp map[string]any) string {
 			}
 		}
 	}
-	if currentTier, okTier := loadResp["currentTier"].(map[string]any); okTier {
-		if id, okID := currentTier["id"].(string); okID {
-			if trimmed := strings.TrimSpace(id); trimmed != "" {
-				return trimmed
-			}
+	return ""
+}
+
+func antigravityTierID(value any) string {
+	if tier, ok := value.(map[string]any); ok {
+		value = tier["id"]
+	}
+	id, _ := value.(string)
+	return strings.TrimSpace(id)
+}
+
+// A rejection applies only to its identified tier, or to all tiers if unscoped.
+// Reason codes/messages are untrusted and do not establish an account-wide ban.
+func antigravityEligibilityError(loadResp map[string]any, tierID string) error {
+	tiers, _ := loadResp["ineligibleTiers"].([]any)
+	for _, rawTier := range tiers {
+		tier, _ := rawTier.(map[string]any)
+		rejectedID := antigravityTierID(tier["tier"])
+		if rejectedID == "" || rejectedID == tierID {
+			return fmt.Errorf("antigravity loadCodeAssist: eligibility rejected for requested tier; check official service eligibility")
 		}
 	}
-	return "free-tier"
+	return nil
+}
+
+func antigravityOperationError(data map[string]any, stage string) error {
+	if data["error"] != nil {
+		return fmt.Errorf("antigravity %s: upstream operation rejected; project discovery failed", stage)
+	}
+	if response, ok := data["response"].(map[string]any); ok && response["error"] != nil {
+		return fmt.Errorf("antigravity %s: upstream operation rejected; project discovery failed", stage)
+	}
+	return nil
 }
 
 // BuildAuthURL generates the OAuth authorization URL.
@@ -254,13 +279,13 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 
 	rawBody, errMarshal := json.Marshal(loadReqBody)
 	if errMarshal != nil {
-		return "", fmt.Errorf("marshal request body: %w", errMarshal)
+		return "", fmt.Errorf("antigravity loadCodeAssist: cannot encode project discovery request")
 	}
 
 	endpointURL := fmt.Sprintf("%s/%s:loadCodeAssist", APIEndpoint, APIVersion)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, strings.NewReader(string(rawBody)))
 	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
+		return "", fmt.Errorf("antigravity loadCodeAssist: cannot create project discovery request")
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Accept", "*/*")
@@ -269,35 +294,48 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 
 	resp, errDo := o.httpClient.Do(req)
 	if errDo != nil {
-		return "", fmt.Errorf("execute request: %w", errDo)
+		return "", fmt.Errorf("antigravity loadCodeAssist: request failed")
 	}
 	defer func() {
 		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("antigravity loadCodeAssist: close body error: %v", errClose)
+			log.Error("antigravity loadCodeAssist: close body error")
 		}
 	}()
 
 	bodyBytes, errRead := io.ReadAll(resp.Body)
 	if errRead != nil {
-		return "", fmt.Errorf("read response: %w", errRead)
+		return "", fmt.Errorf("antigravity loadCodeAssist: cannot read project discovery response")
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return "", &HTTPStatusError{
 			StatusCodeValue: resp.StatusCode,
-			Message:         fmt.Sprintf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes))),
+			Message:         fmt.Sprintf("antigravity loadCodeAssist: request failed with status %d", resp.StatusCode),
 		}
 	}
 
 	var loadResp map[string]any
 	if errDecode := json.Unmarshal(bodyBytes, &loadResp); errDecode != nil {
-		return "", fmt.Errorf("decode response: %w", errDecode)
+		return "", fmt.Errorf("antigravity loadCodeAssist: invalid response")
 	}
 
+	if errOperation := antigravityOperationError(loadResp, "loadCodeAssist"); errOperation != nil {
+		return "", errOperation
+	}
 	projectID := extractCloudaicompanionProject(loadResp)
+	tierID := antigravityTierID(loadResp["currentTier"])
+	if projectID == "" {
+		tierID = defaultAntigravityTierID(loadResp)
+	}
+	if errEligibility := antigravityEligibilityError(loadResp, tierID); errEligibility != nil {
+		return "", errEligibility
+	}
 
 	if projectID == "" {
-		projectID, err = o.OnboardUser(ctx, accessToken, defaultAntigravityTierID(loadResp))
+		if tierID == "" {
+			return "", fmt.Errorf("antigravity loadCodeAssist: no offered default tier; project discovery cannot onboard user")
+		}
+		projectID, err = o.OnboardUser(ctx, accessToken, tierID)
 		if err != nil {
 			return "", err
 		}
@@ -312,16 +350,19 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 
 // OnboardUser attempts to fetch the project ID via onboardUser by polling for completion
 func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID string) (string, error) {
-	log.Infof("Antigravity: onboarding user with tier: %s", tierID)
+	tierID = strings.TrimSpace(tierID)
+	if tierID == "" {
+		return "", fmt.Errorf("antigravity onboardUser: missing tier")
+	}
 	userAgent := o.nodeUserAgent()
 	requestBody := map[string]any{
-		"tier_id":  tierID,
-		"metadata": antigravityControlPlaneMetadata(userAgent),
+		"tierId":   tierID,
+		"metadata": antigravityControlPlaneMetadata(),
 	}
 
 	rawBody, errMarshal := json.Marshal(requestBody)
 	if errMarshal != nil {
-		return "", fmt.Errorf("marshal request body: %w", errMarshal)
+		return "", fmt.Errorf("antigravity onboardUser: cannot encode project discovery request")
 	}
 
 	maxAttempts := 5
@@ -339,7 +380,7 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 		req, errRequest := http.NewRequestWithContext(reqCtx, http.MethodPost, endpointURL, strings.NewReader(string(rawBody)))
 		if errRequest != nil {
 			cancel()
-			return "", fmt.Errorf("create request: %w", errRequest)
+			return "", fmt.Errorf("antigravity onboardUser: cannot create onboarding request")
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		req.Header.Set("Accept", "*/*")
@@ -350,25 +391,28 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 		resp, errDo := o.httpClient.Do(req)
 		if errDo != nil {
 			cancel()
-			return "", fmt.Errorf("execute request: %w", errDo)
+			return "", fmt.Errorf("antigravity onboardUser: request failed")
 		}
 
 		bodyBytes, errRead := io.ReadAll(resp.Body)
 		if errClose := resp.Body.Close(); errClose != nil {
-			log.Errorf("close body error: %v", errClose)
+			log.Error("antigravity onboardUser: close body error")
 		}
 		cancel()
 
 		if errRead != nil {
-			return "", fmt.Errorf("read response: %w", errRead)
+			return "", fmt.Errorf("antigravity onboardUser: cannot read project discovery response")
 		}
 
 		if resp.StatusCode == http.StatusOK {
 			var data map[string]any
 			if errDecode := json.Unmarshal(bodyBytes, &data); errDecode != nil {
-				return "", fmt.Errorf("decode response: %w", errDecode)
+				return "", fmt.Errorf("antigravity onboardUser: invalid response")
 			}
 
+			if errOperation := antigravityOperationError(data, "onboardUser"); errOperation != nil {
+				return "", errOperation
+			}
 			if done, okDone := data["done"].(bool); okDone && done {
 				projectID := ""
 				if responseData, okResp := data["response"].(map[string]any); okResp {
@@ -376,29 +420,19 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 				}
 
 				if projectID != "" {
-					log.Infof("Successfully fetched project_id: %s", util.HideAPIKey(projectID))
 					return projectID, nil
 				}
 
-				return "", fmt.Errorf("no project_id in response")
+				return "", fmt.Errorf("antigravity onboardUser: no project_id in completed response")
 			}
 
 			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		responsePreview := strings.TrimSpace(string(bodyBytes))
-		if len(responsePreview) > 500 {
-			responsePreview = responsePreview[:500]
-		}
-
-		responseErr := responsePreview
-		if len(responseErr) > 200 {
-			responseErr = responseErr[:200]
-		}
 		return "", &HTTPStatusError{
 			StatusCodeValue: resp.StatusCode,
-			Message:         fmt.Sprintf("http %d: %s", resp.StatusCode, responseErr),
+			Message:         fmt.Sprintf("antigravity onboardUser: request failed with status %d", resp.StatusCode),
 		}
 	}
 
